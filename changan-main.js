@@ -10,12 +10,18 @@ const express = require("express");
 
 // main.js loads dotenv but does not auto-start when required as a module.
 const { initializeServer, ProxyServerSystem } = require("./main");
+const AuthSwitcher = require("./src/auth/AuthSwitcher");
 const ConfigLoader = require("./src/utils/ConfigLoader");
 const StatusRoutes = require("./src/routes/StatusRoutes");
 
 const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 const INTERNAL_WS_HOST = "127.0.0.1";
+
+const singleAccountRuntime = {
+    last429At: null,
+    last429Message: null,
+};
 
 if (process.platform !== "win32") {
     // New auth/session files created by this process default to owner-only access.
@@ -54,6 +60,11 @@ function getAiStudioAppUrl() {
     return url.toString();
 }
 
+function isSingleCanonicalAccount(authSource) {
+    const indices = authSource?.getRotationIndices?.();
+    return Array.isArray(indices) && indices.length === 1;
+}
+
 // Fail closed in production instead of silently exposing the upstream default key "123456".
 const originalLoadConfiguration = ConfigLoader.prototype.loadConfiguration;
 ConfigLoader.prototype.loadConfiguration = function loadHardenedConfiguration() {
@@ -65,6 +76,52 @@ ConfigLoader.prototype.loadConfiguration = function loadHardenedConfiguration() 
     config.maxRequestBodyBytes = getRequestBodyLimit();
     config.aiStudioAppUrl = getAiStudioAppUrl();
     return config;
+};
+
+// In a one-account deployment, request-count rotation only refreshes the same
+// browser/account and does not increase Google quota. Keep the context stable.
+const originalShouldSwitchByUsage = AuthSwitcher.prototype.shouldSwitchByUsage;
+AuthSwitcher.prototype.shouldSwitchByUsage = function shouldSwitchByUsageSingleAccountAware() {
+    if (isSingleCanonicalAccount(this.authSource)) {
+        if (!this.__singleAccountRotationNoticeLogged && this.config.switchOnUses > 0) {
+            this.logger.info(
+                `[Hardening] Single-account mode detected; ignoring SWITCH_ON_USES=${this.config.switchOnUses}.`
+            );
+            this.__singleAccountRotationNoticeLogged = true;
+        }
+        return false;
+    }
+    return originalShouldSwitchByUsage.call(this);
+};
+
+// A 429 on the only account usually means an upstream rate/quota limit. Restarting
+// the same browser cannot create new quota and can make a healthy session less stable.
+// Preserve the context, return Google's error to the caller, and let future requests
+// probe naturally after the upstream limit resets.
+const originalHandleRequestFailureAndSwitch = AuthSwitcher.prototype.handleRequestFailureAndSwitch;
+AuthSwitcher.prototype.handleRequestFailureAndSwitch = async function handleFailureSingleAccountAware(
+    errorDetails,
+    sendErrorCallback
+) {
+    const status = Number(errorDetails?.status);
+    if (status === 429 && isSingleCanonicalAccount(this.authSource)) {
+        singleAccountRuntime.last429At = Date.now();
+        singleAccountRuntime.last429Message = String(errorDetails?.message || "Too Many Requests");
+        this.failureCount = 0;
+
+        this.logger.warn(
+            "[Hardening] Single account received HTTP 429; preserving the current browser context instead of restarting it."
+        );
+        if (sendErrorCallback) {
+            sendErrorCallback("Google rate/quota limit reached on the only configured account.");
+        }
+        return {
+            reason: "single_account_rate_limited",
+            success: false,
+        };
+    }
+
+    return originalHandleRequestFailureAndSwitch.call(this, errorDetails, sendErrorCallback);
 };
 
 // Keep the internal browser WebSocket private. The injected browser client already
@@ -159,13 +216,16 @@ StatusRoutes.prototype.setupRoutes = function setupHardenedRoutes(app, isAuthent
             !!connectionRegistry.getConnectionByAuth(currentAuthIndex, false);
         const busy = requestHandler.isSystemBusy === true;
         const ready = authAvailable && browserConnected && wsConnected && !busy;
+        const singleAccount = isSingleCanonicalAccount(authSource);
 
         return res.status(ready ? 200 : 503).json({
             authAvailable,
             browserConnected,
             busy,
             currentAuthIndex,
+            lastSingleAccount429At: singleAccountRuntime.last429At,
             ready,
+            singleAccount,
             wsConnected,
         });
     });
