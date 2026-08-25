@@ -13,6 +13,7 @@
         "preview:ui": "vite preview",
         "start": "cross-env NODE_ENV=production node changan-main.js",
         "quick-start": "cross-env NODE_ENV=production node changan-main.js",
+        "prestart": "npm run build:ui",
         "start:upstream": "cross-env NODE_ENV=production node main.js",
         "save-auth": "node scripts/auth/saveAuth.js",
         "setup-auth": "node scripts/auth/setupAuth.js",
