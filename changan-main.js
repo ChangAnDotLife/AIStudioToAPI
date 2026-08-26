@@ -11,12 +11,14 @@ const express = require("express");
 // main.js loads dotenv but does not auto-start when required as a module.
 const { initializeServer, ProxyServerSystem } = require("./main");
 const AuthSwitcher = require("./src/auth/AuthSwitcher");
+const BrowserManager = require("./src/core/BrowserManager");
 const ConfigLoader = require("./src/utils/ConfigLoader");
 const StatusRoutes = require("./src/routes/StatusRoutes");
 
 const DEFAULT_AI_STUDIO_APP_URL = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
 const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
 const INTERNAL_WS_HOST = "127.0.0.1";
+const SUPPORTED_STREAMING_MODES = new Set(["auto", "fake", "real"]);
 
 const singleAccountRuntime = {
     last429At: null,
@@ -60,6 +62,16 @@ function getAiStudioAppUrl() {
     return url.toString();
 }
 
+function getRequestedStreamingMode() {
+    const mode = String(process.env.STREAMING_MODE || "auto")
+        .trim()
+        .toLowerCase();
+    if (!SUPPORTED_STREAMING_MODES.has(mode)) {
+        throw new Error(`STREAMING_MODE must be one of: ${Array.from(SUPPORTED_STREAMING_MODES).join(", ")}.`);
+    }
+    return mode;
+}
+
 function isSingleCanonicalAccount(authSource) {
     const indices = authSource?.getRotationIndices?.();
     return Array.isArray(indices) && indices.length === 1;
@@ -72,9 +84,18 @@ ConfigLoader.prototype.loadConfiguration = function loadHardenedConfiguration() 
         throw new Error("API_KEYS is required in production; refusing to use the insecure default key.");
     }
 
+    const requestedStreamingMode = getRequestedStreamingMode();
     const config = originalLoadConfiguration.call(this);
     config.maxRequestBodyBytes = getRequestBodyLimit();
     config.aiStudioAppUrl = getAiStudioAppUrl();
+    config.requestedStreamingMode = requestedStreamingMode;
+    config.autoStreamFallback = requestedStreamingMode === "auto";
+
+    // Upstream RequestHandler understands real/fake. In auto mode it should take
+    // the real-stream path first; the browser-side init script below performs a
+    // pre-body fallback when Google rejects streamGenerateContent with 403
+    // PERMISSION_DENIED.
+    config.streamingMode = requestedStreamingMode === "auto" ? "real" : requestedStreamingMode;
     return config;
 };
 
@@ -124,6 +145,114 @@ AuthSwitcher.prototype.handleRequestFailureAndSwitch = async function handleFail
     return originalHandleRequestFailureAndSwitch.call(this, errorDetails, sendErrorCallback);
 };
 
+// STREAMING_MODE=auto is implemented below the remote Build App by wrapping fetch
+// in every browser frame before application code runs. A streamGenerateContent 403
+// with PERMISSION_DENIED is retried exactly once as generateContent, before any
+// headers/body have been sent through the internal WebSocket. The successful JSON
+// response is wrapped as one valid Google SSE event, so the existing upstream real-
+// stream adapters continue to work for Gemini/OpenAI/Responses/Anthropic clients.
+const originalGetPrivacyProtectionScript = BrowserManager.prototype._getPrivacyProtectionScript;
+BrowserManager.prototype._getPrivacyProtectionScript = function getPrivacyScriptWithAutoStreamFallback(...args) {
+    const baseScript = originalGetPrivacyProtectionScript.apply(this, args);
+    if (this.config?.autoStreamFallback !== true) {
+        return baseScript;
+    }
+
+    const autoStreamFallbackScript = String.raw`
+        ;(() => {
+            if (window.__changanAutoStreamFallbackInstalled === true) return;
+            window.__changanAutoStreamFallbackInstalled = true;
+
+            const originalFetch = window.fetch.bind(window);
+
+            window.fetch = async function changanAutoStreamFetch(input, init) {
+                const inputUrl =
+                    typeof input === "string"
+                        ? input
+                        : input instanceof URL
+                          ? input.toString()
+                          : null;
+
+                if (!inputUrl) {
+                    return originalFetch(input, init);
+                }
+
+                let requestUrl;
+                try {
+                    requestUrl = new URL(inputUrl, window.location.href);
+                } catch {
+                    return originalFetch(input, init);
+                }
+
+                if (!requestUrl.pathname.includes(":streamGenerateContent")) {
+                    return originalFetch(input, init);
+                }
+
+                const response = await originalFetch(input, init);
+                if (response.status !== 403) {
+                    return response;
+                }
+
+                let errorBody = "";
+                try {
+                    errorBody = await response.clone().text();
+                } catch {
+                    return response;
+                }
+
+                if (!errorBody.includes("PERMISSION_DENIED")) {
+                    return response;
+                }
+
+                const fallbackUrl = new URL(requestUrl.toString());
+                fallbackUrl.pathname = fallbackUrl.pathname.replace(
+                    ":streamGenerateContent",
+                    ":generateContent"
+                );
+                fallbackUrl.searchParams.delete("alt");
+
+                console.warn(
+                    "[ChangAn] streamGenerateContent returned 403 PERMISSION_DENIED; retrying once with generateContent before exposing a response to the client."
+                );
+
+                const fallbackResponse = await originalFetch(fallbackUrl.toString(), init);
+                if (!fallbackResponse.ok) {
+                    console.warn(
+                        "[ChangAn] Automatic fake-stream fallback also failed with HTTP " +
+                            fallbackResponse.status +
+                            "; returning the fallback error."
+                    );
+                    return fallbackResponse;
+                }
+
+                const fullBody = await fallbackResponse.text();
+                const sseBody =
+                    fullBody
+                        .split(/\r?\n/)
+                        .map(function (line) {
+                            return "data: " + line;
+                        })
+                        .join("\n") + "\n\n";
+
+                const headers = new Headers(fallbackResponse.headers);
+                headers.set("content-type", "text/event-stream; charset=utf-8");
+                headers.set("x-changan-stream-fallback", "fake");
+                headers.delete("content-length");
+                headers.delete("content-encoding");
+                headers.delete("transfer-encoding");
+
+                return new Response(sseBody, {
+                    headers,
+                    status: fallbackResponse.status,
+                    statusText: fallbackResponse.statusText,
+                });
+            };
+        })();
+    `;
+
+    return `${baseScript}\n${autoStreamFallbackScript}`;
+};
+
 // Keep the internal browser WebSocket private. The injected browser client already
 // connects to ws://127.0.0.1:9998, so there is no reason to bind this port publicly.
 const originalStartWebSocketServer = ProxyServerSystem.prototype._startWebSocketServer;
@@ -144,6 +273,13 @@ ProxyServerSystem.prototype.start = async function startWithConfiguredTarget(...
     this.logger.info(`[Hardening] AI Studio app target: ${this.browserManager.targetUrl}`);
     this.logger.info(`[Hardening] Internal WebSocket bound to ${INTERNAL_WS_HOST}:${this.config.wsPort}`);
     this.logger.info(`[Hardening] Max request body: ${this.config.maxRequestBodyBytes} bytes`);
+    if (this.config.autoStreamFallback) {
+        this.logger.info(
+            "[Hardening] Streaming mode: auto (real first; 403 PERMISSION_DENIED falls back once to fake streaming)."
+        );
+    } else {
+        this.logger.info(`[Hardening] Streaming mode: ${this.config.requestedStreamingMode}`);
+    }
     return originalStart.apply(this, args);
 };
 
@@ -220,12 +356,14 @@ StatusRoutes.prototype.setupRoutes = function setupHardenedRoutes(app, isAuthent
 
         return res.status(ready ? 200 : 503).json({
             authAvailable,
+            autoStreamFallback: requestHandler.config?.autoStreamFallback === true,
             browserConnected,
             busy,
             currentAuthIndex,
             lastSingleAccount429At: singleAccountRuntime.last429At,
             ready,
             singleAccount,
+            streamingMode: requestHandler.config?.requestedStreamingMode || requestHandler.config?.streamingMode,
             wsConnected,
         });
     });
