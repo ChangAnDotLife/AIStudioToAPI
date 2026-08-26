@@ -226,13 +226,13 @@ BrowserManager.prototype._getPrivacyProtectionScript = function getPrivacyScript
                 }
 
                 const fullBody = await fallbackResponse.text();
-                const sseBody =
-                    fullBody
-                        .split(/\r?\n/)
-                        .map(function (line) {
-                            return "data: " + line;
-                        })
-                        .join("\n") + "\n\n";
+                let ssePayload = fullBody;
+                try {
+                    ssePayload = JSON.stringify(JSON.parse(fullBody));
+                } catch {
+                    ssePayload = fullBody.replace(/\r?\n/g, "");
+                }
+                const sseBody = "data: " + ssePayload + "\n\n";
 
                 const headers = new Headers(fallbackResponse.headers);
                 headers.set("content-type", "text/event-stream; charset=utf-8");
