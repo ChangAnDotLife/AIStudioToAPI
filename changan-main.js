@@ -250,7 +250,8 @@ BrowserManager.prototype._getPrivacyProtectionScript = function getPrivacyScript
         })();
     `;
 
-    return `${baseScript}\n${autoStreamFallbackScript}`;
+    return `${baseScript}
+${autoStreamFallbackScript}`;
 };
 
 // Keep the internal browser WebSocket private. The injected browser client already
